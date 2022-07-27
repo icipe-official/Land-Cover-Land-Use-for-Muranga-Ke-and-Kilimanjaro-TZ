@@ -1,0 +1,419 @@
+library(rgdal)
+library(raster)
+library(RStoolbox)
+library(caret)
+library(blockCV)
+library(randomForest)
+library(car)
+library(imputeTS)
+library(gtools)
+
+setwd("D:/path/to/working/directory")
+
+######################################################################################################################
+##load data
+
+training <- readOGR("02_Vektor/Trainingdata/Muranga_Updated_Polygons/Muranga_Updated_Polygons.shp", stringsAsFactors = FALSE)
+#training <- readOGR("02_Vektor/Trainingdata/Tanzania/farmingsystems_TZ_adapted.shp")
+unique(training$Farming_Sy)
+
+
+
+predictors1 <- brick(paste0("path/to/","_monthly_max_composite.tif"))
+names(predictors1) <- c("201607", "201608","201609","201610","201611","201612",
+                        "201701","201702","201703","201704","201705","201706","201707","201708","201709","201710","201711","201712",
+                        "201801","201802","201803","201804","201805","201806","201807","201808","201809","201810","201811","201812",
+                        "201901","201902","201903","201904","201905","201906")
+
+interpolate_na <- function(vals){
+  return(na.interpolation(vals, option = "linear"))
+}
+
+# interpolate NA values
+Sys.time()
+beginCluster(n = 3)
+cl <- getCluster()
+predictors1_interpolated <- clusterR(predictors1 ,calc, args = list(fun = interpolate_na))
+endCluster()
+Sys.time()
+
+
+predictors2 <- brick(paste0("path/to/", "/Harmonics_coefficients.tif"))
+names(predictors2) <- c("const", "phase1", "phase2", "phase3", "amp1", "amp2", "amp3")
+
+
+metric_names <- c("sos","eos", "los", "baseval", "timemid", "maxval", "ampl", "lderiv", "rderiv", "lint", "sint", "sosval", "eosval")
+predictors3 <- brick(paste0("path/to/", "/phenology_metrics_SG_filter.tif"))
+names(predictors3) <- paste0(rep(metric_names, each = 2), c(1,2))
+
+
+predictors4 <- brick(paste0("path/to/", "/phenology_metrics_harmonic_filter.tif"))
+names(predictors4) <- paste0(rep(metric_names, each = 2), c(1,2))
+
+
+ts_mean <- brick(paste0("path/to/", "/NDVI_mean.tif"))
+ts_sd <- brick(paste0("path/to/", "/NDVI_stddev.tif"))
+
+ts_metrics <- stack(ts_mean, ts_sd)
+
+
+predictors5 <- stack(predictors2, predictors3)
+predictors6 <- stack(predictors1, ts_metrics)
+predictors7 <- stack(predictors1, predictors2, predictors3)
+
+# reproject training data to coordinate system of predictor variables
+training <- spTransform(training, crs(predictors1))
+
+levels_order <- c("Agro-pastoral system", "Agroforestry", "Tree crop system",
+                  "Coffee-based system", "Tea-based system", "Vegetable system", 
+                  "Large-scale commercial maize system", "Large-scale commercial pineapple system", "Small-scale maize mixed system" ,
+                  "Natural vegetation", "Urban-based system", "Water bodies")
+levels_order <- c("Agro-pastoral system", "Agroforestry", "Tree crop system",
+                  "Coffee-based system", "Vegetable system",
+                  "Large-scale commercial wheat system", "Large-scale commercial sugarcane system",
+                  "Small-scale banana mixed system","Mixed maize/sunflower system",
+                  "Forest-based system","Urban-based system", "Water bodies")
+
+
+training$Farming_Sy <- factor(training$Farming_Sy, levels = levels_order)
+unique(training$Farming_Sy)
+
+class_factors <- data.frame(class_number = seq(1, length(levels(training$Farming_Sy))), class = levels(training$Farming_Sy))
+
+# rasterize training polygons and then convert it to points
+training_r <- rasterize(training, predictors1[[1]], field = "Farming_Sy")
+training_p <- rasterToPoints(training_r, spatial = TRUE)
+names(training_p) <- "class"
+
+training_p$class <- factor(training_p$class, levels = class_factors$class_number, labels = class_factors$class)
+
+# extract predictor values at training points and merge them to the points
+extr_vals1 <- extract(predictors1, training_p)
+extr_vals2 <- extract(predictors2, training_p)
+extr_vals3 <- extract(predictors3, training_p)
+extr_vals4 <- extract(predictors4, training_p)
+extr_vals6 <- extract(ts_metrics, training_p)
+
+training_p1 <- training_p[,1]
+training_p1@data <- cbind(training_p1@data, extr_vals1)
+
+training_p2 <- training_p[,1]
+training_p2@data <- cbind(training_p2@data, extr_vals2)
+
+training_p3 <- training_p[,1]
+training_p3@data <- cbind(training_p3@data, extr_vals3)
+
+training_p4 <- training_p[,1]
+training_p4@data <- cbind(training_p4@data, extr_vals4)
+
+training_p5 <- training_p[,1]
+training_p5@data <- cbind(training_p5@data, extr_vals2, extr_vals3)
+
+training_p6 <- training_p[,1]
+training_p6@data <- cbind(training_p6@data, extr_vals1, extr_vals6)
+
+training_p7 <- training_p[,1]
+training_p7@data <- cbind(training_p7@data, extr_vals1, extr_vals2, extr_vals3)
+
+
+# randomly create training data split (spatially grouped)
+set.seed(42)
+
+spBlocks_list <- list()
+for (r in c(1:10)){
+  spBlocks <- spatialBlock(training_p, blocks = training, k = 3)
+  spBlocks_list[[r]] <- spBlocks
+  
+  for(f in c(1:3)){
+    train <- spBlocks[[1]][[f]][[1]]
+    test <- spBlocks[[1]][[f]][[2]]
+    column_name <- paste0("repeat", r, "fold", f)
+    
+    training_p@data[,column_name] <- NA
+    training_p@data[train,column_name] <- 1
+    training_p@data[test,column_name] <- 0
+    
+  }
+  
+}
+
+
+sum(duplicated(t(training_p@data)))
+
+######################################################################################################################
+##Class accuracy matrices
+
+# create dataframe that will be filled with accuracy measures of all 30 classification results
+accuracy_df <- data.frame(fold = names(training_p@data)[2:length(names(training_p@data))])
+predictor_sets <- c("predictors1", "predictors2", "predictors3", "predictors4", "predictors5", "predictors6", "predictors7")
+measures <- c("accuracy", "kappa")
+scenarios <- paste(rep(predictor_sets, each = length(measures)), measures, sep = "_")
+accuracy_df[,scenarios] <- NA
+
+rownames <- c("Class: Agro - Pastrol System","Class: Agroforestry","Class: Tree Crop System", 
+              "Class: Coffee - based system", "Class: Tea - Based System", "Class: Vegetable System",
+              "Class: Large - Scale Commercial Maize System" , "Class: Large - Scale Commercial Pineaple System", 
+              "Class: Small-scale maize mixed system",   "Class: Natural Vegetation",                   
+              "Class: Urban-based system" ,"Class: Water Bodies" )
+rownames <- c("Class: Agro-pastoral system", "Class: Agroforestry", "Class: Tree crop system",
+              "Class: Coffee-based system", "Class: Vegetable system",
+              "Class: Large-scale commercial wheat system", "Class: Large-scale commercial sugarcane system",
+              "Class: Small-scale banana mixed system","Class: Mixed maize/sunflower system",
+              "Class: Forest-based system","Class: Urban-based system", "Class: Water bodies")
+
+
+colnames <- c("Sensitivity","Specificity","Pos Pred Value","Neg Pred Value" , "Precision","Recall",
+              "F1","Prevalence","Detection Rate","Detection Prevalence","Balanced Accuracy")
+
+
+m1 <- array(dim = c(12,11,30))
+rownames(m1) <- rownames
+colnames(m1) <- colnames
+m2 <- array(dim = c(12,11,30))
+rownames(m2) <- rownames
+colnames(m2) <- colnames
+m3 <- array(dim = c(12,11,30))
+rownames(m3) <- rownames
+colnames(m3) <- colnames
+m4 <- array(dim = c(12,11,30))
+rownames(m4) <- rownames
+colnames(m4) <- colnames
+m5 <- array(dim = c(12,11,30))
+rownames(m5) <- rownames
+colnames(m5) <- colnames
+m6 <- array(dim = c(12,11,30)) 
+rownames(m6) <- rownames
+colnames(m6) <- colnames
+m7 <- array(dim = c(12,11,30)) 
+rownames(m7) <- rownames
+colnames(m7) <- colnames
+
+######################################################################################################################
+# Random forest classifications
+
+for(c in c(2:length(names(training_p@data)))){
+  print(c)
+  f = names(training_p@data)[c]
+  print(f)
+
+  # define with training split should be used for the current classification
+  train <- which(training_p@data[,c] == 1)
+  test <- which(training_p@data[,c] == 0)
+  
+  # random forests for all predictor sets
+  rf1 <- randomForest(class~., data = training_p1@data[train,])
+  confusion1 <- confusionMatrix(data = predict(rf1, training_p1@data[test,]), reference = training_p1@data$class[test])
+  m1[,,c-1] <- confusion1$byClass
+  acc1 <- confusion1$overall[1]
+  kappa1 <- confusion1$overall[2]
+  
+  rf2 <- randomForest(class~., data = training_p2@data[train,])
+  confusion2 <- confusionMatrix(data = predict(rf2, training_p2@data[test,]), reference = training_p2@data$class[test])
+  m2[,,c-1] <- confusion2$byClass
+  acc2 <- confusion2$overall[1]
+  kappa2 <- confusion2$overall[2]
+  
+  rf3 <- randomForest(class~., data = training_p3@data[train,])
+  confusion3 <- confusionMatrix(data = predict(rf3, training_p3@data[test,]), reference = training_p3@data$class[test])
+  m3[,,c-1] <- confusion3$byClass
+  acc3 <- confusion3$overall[1]
+  kappa3 <- confusion3$overall[2]
+  
+  rf4 <- randomForest(class~., data = training_p4@data[train,])
+  confusion4 <- confusionMatrix(data = predict(rf4, training_p4@data[test,]), reference = training_p4@data$class[test])
+  m4[,,c-1] <- confusion4$byClass
+  acc4 <- confusion4$overall[1]
+  kappa4 <- confusion4$overall[2]
+  
+  rf5 <- randomForest(class~., data = training_p5@data[train,])
+  confusion5 <- confusionMatrix(data = predict(rf5, training_p5@data[test,]), reference = training_p5@data$class[test])
+  m5[,,c-1] <- confusion5$byClass
+  acc5 <- confusion5$overall[1]
+  kappa5 <- confusion5$overall[2]
+  
+  rf6 <- randomForest(class~., data = training_p6@data[train,])
+  confusion6 <- confusionMatrix(data = predict(rf6, training_p6@data[test,]), reference = training_p6@data$class[test])
+  m6[,,c-1] <- confusion6$byClass
+  acc6 <- confusion6$overall[1]
+  kappa6 <- confusion6$overall[2]
+  
+  rf7 <- randomForest(class~., data = training_p7@data[train,])
+  confusion7 <- confusionMatrix(data = predict(rf7, training_p7@data[test,]), reference = training_p7@data$class[test])
+  m7[,,c-1] <- confusion7$byClass
+  acc7 <- confusion7$overall[1]
+  kappa7 <- confusion7$overall[2]
+
+  # fill overview dataframe with current results
+  accuracy_df[accuracy_df$fold == f, c(2:15)] <- c(acc1, kappa1, acc2, kappa2, acc3, kappa3, acc4, kappa4, acc5, kappa5, acc6, kappa6, acc7, kappa7)
+  # save result if it is the best so far
+  if (acc1 == max(accuracy_df$predictors1_accuracy, na.rm = TRUE)){
+    rf1_best <- rf1
+  }
+  if (acc2 == max(accuracy_df$predictors2_accuracy, na.rm = TRUE)){
+    rf2_best <- rf2
+  }
+  if (acc3 == max(accuracy_df$predictors3_accuracy, na.rm = TRUE)){
+    rf3_best <- rf3
+  }
+  if (acc4 == max(accuracy_df$predictors4_accuracy, na.rm = TRUE)){
+    rf4_best <- rf4
+  }
+  if (acc5 == max(accuracy_df$predictors5_accuracy, na.rm = TRUE)){
+    rf5_best <- rf5
+  }
+  if (acc6 == max(accuracy_df$predictors6_accuracy, na.rm = TRUE)){
+    rf6_best <- rf6
+  }
+  if (acc7 == max(accuracy_df$predictors7_accuracy, na.rm = TRUE)){
+    rf7_best <- rf7
+  }
+  rm(rf1, rf2, rf3, rf4, rf5, rf6, rf7)
+
+}
+
+rm(confusion1, confusion2, confusion3, confusion4, confusion5, confusion6, confusion7,
+   acc1, acc2, acc3, acc4, acc5, acc6,acc7, kappa1, kappa2, kappa3,kappa4, kappa5, kappa6, kappa7, c, f)
+
+# calculate mean accuracies and standard deviations
+m1_mean <- apply(m1,c(1,2), mean, na.rm = TRUE)
+m2_mean <- apply(m2,c(1,2), mean, na.rm = TRUE)
+m3_mean <- apply(m3,c(1,2), mean, na.rm = TRUE)
+m4_mean <- apply(m4,c(1,2), mean, na.rm = TRUE)
+m5_mean <- apply(m5,c(1,2), mean, na.rm = TRUE)
+m6_mean <- apply(m6,c(1,2), mean, na.rm = TRUE)
+m7_mean <- apply(m7,c(1,2), mean, na.rm = TRUE)
+
+colMeans(accuracy_df[,c(2:ncol(accuracy_df))])
+
+for (c in c(2:ncol(accuracy_df))){
+  print(names(accuracy_df)[c])
+  print(sd(accuracy_df[,c]))
+}
+
+# variable importance plot
+varImpPlot(rf1_best, n.var = 10)
+varImpPlot(rf2_best, n.var = 10)
+varImpPlot(rf3_best, n.var = 10)
+varImpPlot(rf4_best, n.var = 10)
+varImpPlot(rf5_best, n.var = 10)
+varImpPlot(rf6_best, n.var = 10)
+varImpPlot(rf7_best, n.var = 10)
+
+####################################################################################################
+# compare predictor sets
+
+# check for normal distribution
+for(t in (c(2:ncol(accuracy_df)))){
+  #if p >= 0.05 --> normal distribution
+  print(names(accuracy_df[t]))
+  print(shapiro.test(accuracy_df[,t]))
+}
+
+# check for equal variance
+combinations <- combn(predictor_sets,2)
+permutations <- permutations(n = length(predictor_sets),r = 2,v = predictor_sets)
+for (s in c(1:ncol(combinations))){
+  for (m in c(1:1)){
+    print(paste(combinations[,s], "and", measures[m]))
+
+    g1 <- accuracy_df[,paste(combinations[1,s], measures[m], sep = "_")]
+    g2 <- accuracy_df[,paste(combinations[2,s], measures[m], sep = "_")]
+
+    y <- c(g1, g2)
+    g <- as.factor(c(rep(1, 30), rep(2,30)))
+
+    #test on equal variances, if p >= 0.05 --> same variances
+    print(leveneTest(y, g))
+
+  }
+}
+
+
+# paired t-test
+for (s in c(1:42)){ #nrow(permutations)
+  for (m in c(1:1)){
+    print(paste(permutations[s,], "and", measures[m]))
+
+    g1 <- accuracy_df[,paste(permutations[s,1], measures[m], sep = "_")]
+    g2 <- accuracy_df[,paste(permutations[s,2], measures[m], sep = "_")]
+
+    #y <- c(g1, g2)
+    #g <- as.factor(c(rep(1, 30), rep(2,30)))
+
+    print(t.test(g1, g2, alternative = "greater",paired = TRUE, var.equal = TRUE))
+    #print(t.test(g1, g2, alternative = "greater",paired = TRUE, var.equal = FALSE))
+    print(wilcox.test(g1, g2, alternative = "greater",paired = TRUE))
+
+  }
+}
+
+for (s in c(1:ncol(combinations))){ #nrow(permutations)
+  for (m in c(1:1)){
+    print(paste(combinations[,s], "and", measures[m]))
+
+    g1 <- accuracy_df[,paste(combinations[1,s], measures[m], sep = "_")]
+    g2 <- accuracy_df[,paste(combinations[2,s], measures[m], sep = "_")]
+
+    #y <- c(g1, g2)
+    #g <- as.factor(c(rep(1, 30), rep(2,30)))
+
+    print(t.test(g1, g2, alternative = "two.sided",paired = TRUE, var.equal = TRUE))
+
+  }
+}
+
+
+permutations_selected <- permutations[c(3,9,15,19:24,28,34,40),]
+for (s in c(1:nrow(permutations_selected))){ #nrow(permutations)
+  #for (m in c(1:2)){
+  m = 1
+    print(paste(permutations_selected[s,], "and", measures[m]))
+
+    g1 <- accuracy_df[,paste(permutations_selected[s,1], measures[m], sep = "_")]
+    g2 <- accuracy_df[,paste(permutations_selected[s,2], measures[m], sep = "_")]
+
+    #y <- c(g1, g2)
+    #g <- as.factor(c(rep(1, 30), rep(2,30)))
+
+    print(wilcox.test(g1, g2, alternative = "greater",paired = TRUE))
+    print(wilcox.test(g1, g2, alternative = "two.sided",paired = TRUE))
+
+}
+
+# confusion matrices
+# attention: adapt test variable to number of classification that had best accuracy (see training_p@data)
+confusionMatrix(data = predict(rf1_best, training_p1@data[test,]), reference = training_p1@data$class[test])
+confusionMatrix(data = predict(rf2_best, training_p2@data[test,]), reference = training_p2@data$class[test])
+confusionMatrix(data = predict(rf3_best, training_p3@data[test,]), reference = training_p3@data$class[test])
+confusionMatrix(data = predict(rf4_best, training_p4@data[test,]), reference = training_p4@data$class[test])
+confusionMatrix(data = predict(rf5_best, training_p5@data[test,]), reference = training_p5@data$class[test])
+confusionMatrix(data = predict(rf6_best, training_p6@data[test,]), reference = training_p6@data$class[test])
+confusionMatrix(data = predict(rf7_best, training_p7@data[test,]), reference = training_p7@data$class[test])
+
+
+confusion1 <- confusionMatrix(data = predict(rf1_best, training_p1@data), reference = training_p1@data$class)
+confusion1 <- confusionMatrix(data = predict(rf2_best, training_p2@data), reference = training_p2@data$class)
+confusion1 <- confusionMatrix(data = predict(rf3_best, training_p3@data), reference = training_p3@data$class)
+confusion1 <- confusionMatrix(data = predict(rf4_best, training_p4@data), reference = training_p4@data$class)
+confusion1 <- confusionMatrix(data = predict(rf5_best, training_p5@data), reference = training_p5@data$class)
+confusion1 <- confusionMatrix(data = predict(rf6_best, training_p6@data), reference = training_p6@data$class)
+confusion1 <- confusionMatrix(data = predict(rf7_best, training_p7@data), reference = training_p7@data$class)
+
+
+
+# export classification maps
+rf_map1 <- predict(predictors1, rf1_best)
+writeRaster(rf_map1, paste0("03_Raster/classifications/", aoi, "/", aoi, "_RF_predictors1.tif"))
+rf_map2 <- predict(predictors2, rf2_best)
+writeRaster(rf_map2, paste0("03_Raster/classifications/", aoi, "/", aoi, "_RF_predictors2.tif"))
+rf_map3 <- predict(predictors3, rf3_best)
+writeRaster(rf_map3, paste0("03_Raster/classifications/", aoi, "/", aoi, "_RF_predictors3.tif"))
+rf_map4 <- predict(predictors4, rf4_best)
+writeRaster(rf_map4, paste0("03_Raster/classifications/", aoi, "/", aoi, "_RF_predictors4.tif"))
+rf_map5 <- predict(predictors5, rf5_best)
+writeRaster(rf_map5, paste0("03_Raster/classifications/", aoi, "/", aoi, "_RF_predictors5.tif"))
+rf_map6 <- predict(predictors6, rf6_best)
+writeRaster(rf_map6, paste0("03_Raster/classifications/", aoi, "/", aoi, "_RF_predictors6.tif"))
+rf_map7 <- predict(predictors7, rf7_best)
+writeRaster(rf_map7, paste0("03_Raster/classifications/", aoi, "/", aoi, "_RF_predictors7.tif"))
+

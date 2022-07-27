@@ -1,0 +1,132 @@
+library(raster)
+library(gdalUtils)
+library(snow)
+library(parallel)
+library(rgdal)
+
+setwd("D:/path/to/working/directory/")
+
+# load NDVI time-series (original values)
+files <- list.files(path = "path/to/NDVI/time-series/",pattern = glob2rx("Time_series_*_merged.tif$"), full.names = TRUE)
+for(f in 1:length(files)){
+  if(f == 1){
+    ndvi_stack <- brick(files[f])
+  }else{
+    ndvi_stack <- stack(ndvi_stack, brick(files[f]))
+  }
+}
+ 
+ 
+prec <- brick("path/to/CHIRPS/precipiation/CHIRPS_monthly_prec.tif")[[13:36]] # select the needed layers in case the layer stack includes a longer time period
+
+
+training <- readOGR("path/to/training/data/Muranga_Updated_Polygons.shp", stringsAsFactors = FALSE)
+#training <- readOGR("path/to/training/data/farmingsystems_TZ_adapted.shp", stringsAsFactors = FALSE)
+
+# rasterize training polygons and then transform to points, reproject coordinate system
+training$Farming_Sy <- factor(training$Farming_Sy)
+training <- spTransform(training, crs(ndvi_stack))
+training_r <- rasterize(training, ndvi_stack[[1]], field = "Farming_Sy")
+trainpoints <- rasterToPoints(training_r, spatial = TRUE)
+names(trainpoints) <- "class"
+trainpoints_wgs <- spTransform(trainpoints, crs(prec))
+
+# reformat trainingpoints to a raster with the smallest possible number of pixels (spatial reference does not matter anymore)
+# Muranga: raster with 100*161 pixels (--> 16089 training points)
+# Kilimanjaro: raster with 30*6233 pixels (--> 186963 training points)
+# fill the additional pixels with NA
+classes <- trainpoints$class
+classes <- c(classes, rep(NA, 11))  #Muranga: rep(NA,11))  #Tanzania: rep(NA, 27))
+classes_2d <- array(data = classes, dim = c(100, 161)) #dim = c(100, 161))  #Tanzania: dim = c(30, 6233))
+classes_r <- raster(classes_2d)
+# save original coordinates in the raster as well so that they do not get lost
+coords_x <- c(trainpoints@coords[,1], rep(NA,11)) #Muranga: rep(NA,11))   #Tanzania: rep(NA, 27)) 
+coords_y <- c(trainpoints@coords[,2], rep(NA, 11)) #Muranga: rep(NA,11))   #Tanzania:rep(NA, 27))
+coords_x_2d <- array(data = coords_x, dim = c(100,717)) #Muranga: dim = c(100, 161))   #Tanzania: dim = c(30, 6233))
+coords_y_2d <- array(data = coords_y, dim = c(100,717))#Muranga: dim = c(100, 161))   #Tanzania: dim = c(30, 6233))
+coords_x_r <- raster(coords_x_2d)
+coords_y_r <- raster(coords_y_2d)
+coords_r <- stack(coords_x_r, coords_y_r)
+
+# create a reformatted raster that includes the farming system classes and the original coordinates of the training points
+trainpoints_r <- stack(classes_r, coords_r)
+
+writeRaster(trainpoints_r, "path/to/folder/Tuningdata_Timesat_classes.tif", overwrite = TRUE)
+
+# extract original NDVI values at the training point locations
+# reformat the extracted values to a new (smaller) raster in the same way as the land use information
+ndvi_vals <- raster::extract(ndvi_stack, trainpoints)
+ndvi_vals <- rbind(ndvi_vals, matrix(data = NA, nrow = 11, ncol = ncol(ndvi_vals)))# Tanzania: nrow = 27, ncol = ncol(ndvi_vals)))  #Muranga: nrow = 11, ncol = ncol(ndvi_vals)))
+ndvi_vals_1d <- as.vector(ndvi_vals)
+ndvi_vals_3d <- array(data = ndvi_vals_1d, dim = c(100,161,ncol(ndvi_vals))) #Tanzania: c(30,6233,ncol(ndvi_vals)))  #Muranga: c(100,161,ncol(ndvi_vals)))
+ndvi_vals_r <- brick(ndvi_vals_3d)
+writeRaster(ndvi_vals_r, "path/to/folder/Tuningdata_Timesat_NDVI_timeseries.tif", overwrite = TRUE)
+
+# extract precipiation values at the training point locations
+# reformat the extracted values to a new (smaller) raster in the same way as the land use information
+prec_vals <- raster::extract(prec, trainpoints_wgs)
+prec_vals <- rbind(prec_vals, matrix(data = NA,nrow = 11, ncol = ncol(prec_vals)))  # Muranga: nrow = 11, ncol = ncol(prec_vals))) #Tanzania: nrow = 27, ncol = ncol(prec_vals)))
+prec_vals_1d <- as.vector(prec_vals)
+prec_vals_3d <- array(data = prec_vals_1d, dim = c(100,161,ncol(prec_vals)))   #Muranga: c(100,161,ncol(prec_vals))) #Tanzania: c(30,6233,ncol(prec_vals)))
+prec_vals_r <- brick(prec_vals_3d)
+writeRaster(prec_vals_r, "path/to/folder/Tuningdata_Timesat_precipitation.tif", overwrite = TRUE)
+
+############################################################################################################################################
+# convert tuning data into TIMESAT format
+
+setwd("D:/path/to/working/directory/")
+
+# load layernames (dates of NDVI images)
+layers <- read.table("layernames.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+layers$day <- as.Date(as.character(layers$date), format = "%Y%m%d")
+
+# create list with all possible dates (5-day interval)
+all_days <- data.frame(day = seq(as.Date("2017-07-03"), as.Date("2019-07-01"), by = 5))
+all_days$year <- format(all_days$day, "%Y")
+
+all(layers$day %in% all_days$day)
+
+all_days <- merge(all_days, layers[,c(2,5)], by = "day", all.x = TRUE)
+
+
+# data to convert: reformatted NDVI time series
+ndvi_stack <- ndvi_vals_r
+
+# create empty template with NA values (=-32768)
+empty_template <- ndvi_stack[[1]]                       
+empty_template[] <- -32768
+storage.mode(empty_template[]) <- "integer"
+
+# create a list with all file names + number of files in the first line
+pathnames <- paste0("NDVI_", c(gsub("-", "", as.character(all_days$day))))
+path_list <- c(as.character(length(all_days$day)))
+
+# convert all NDVI layers, if data not available for the specific date, export empty template
+for (i in c(1:length(all_days$day))){
+  d <- all_days$day[i]
+  name <- paste0(pathnames[i], ".img")
+  if (d %in% layers$day){
+    path <- paste0(getwd(), "//", pathnames[i])
+    path_list <- c(path_list, path)
+    r <- ndvi_stack[[which(layers$day == d)]]
+    r <- r*32767
+    r[is.na(r)] <- -32768
+    storage.mode(r[]) <- "integer"
+    
+    writeRaster(r, name, format = "HFA", overwrite = TRUE)
+    
+  }else{
+    path <- paste0(getwd(), "//", pathnames[i])
+    path_list <- c(path_list, path)
+    writeRaster(empty_template, name,format = "HFA", overwrite= TRUE)
+  }
+}
+# export layer list
+write.table(path_list, "ndvi_list_short.txt", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+# transform data to ENVI format
+files <- list.files(pattern = ".img$")
+for(f in files){
+  gdal_translate(f, dst_dataset = substr(f, 1, nchar(f)-4), ot = "Int16", of = "ENVI")
+}
+

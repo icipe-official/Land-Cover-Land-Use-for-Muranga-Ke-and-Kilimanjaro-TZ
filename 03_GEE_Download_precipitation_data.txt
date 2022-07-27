@@ -1,0 +1,66 @@
+//uploaded Shapefiles of ROIs
+//var table = ee.FeatureCollection("users/katrin/Boundary_Kenya")
+//var table = ee.FeatureCollection("users/katrin/Tanzania_Ovacadosites");
+var table = ee.FeatureCollection("users/katrin/Tanzania_Ovacadosites_with_elev_mask");
+
+
+//roi for kenya
+//var roi = ee.Geometry.Rectangle(36.7, -1.2, 37.5, -0.6)
+
+//roi for tansania
+var roi = ee.Geometry.Rectangle(36.85, -3.7, 37.76, -2.81);
+
+var start = ee.Date('2016-07-01')
+var end = ee.Date('2019-07-01')
+
+var start_lag = ee.Date('2016-06-01')
+var end_lag = ee.Date('2019-06-01')
+
+var startyr = start_lag.get("year")
+var endyr = end_lag.get("year")
+
+
+var shpLayer = ui.Map.Layer(table, {color: "FF0000"}, "shp")
+//Map.layers().add(shpLayer)
+
+
+var chirps //= ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+            = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD")
+      .filterBounds(table)
+      .filterDate(start, end)
+      
+
+var chirps_lag = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+      .filterBounds(table)
+      .filterDate(start_lag, end_lag)
+
+print(chirps)
+
+
+//Calculate sum of precipitation per month
+var sum_monthly_prec = function(i){
+  i = ee.Number(i);
+  var months = ee.List.sequence(1,12);
+  var filteredSum = months.map(function(j){
+    var filtered = ee.ImageCollection(chirps_lag.filter(ee.Filter.calendarRange(i,i, 'year'))
+                              .filter(ee.Filter.calendarRange(j,j,'month')));
+    var monthSum = ee.Image(filtered.sum())
+                    .set("year", i)
+                    .set("month", j)
+                    //.copyProperties(filtered.first(),['system:index']);
+    return monthSum;
+  });
+  return filteredSum;
+};
+var years = ee.List.sequence(startyr, endyr);
+var prec_sum = ee.ImageCollection(years.map(sum_monthly_prec).flatten()).toBands()
+//print(prec_sum);
+
+//Download monthly precipitation
+Export.image.toDrive({
+  image: prec_sum,
+  description: "CHIRPS_monthly_pc_201606_201906",
+  region: roi,
+  //crs: "EPSG:4326",
+  maxPixels: 1e09
+})

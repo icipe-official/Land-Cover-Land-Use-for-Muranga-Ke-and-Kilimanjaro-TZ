@@ -1,0 +1,165 @@
+library(raster)
+library(gdalUtils)
+library(snow)
+library(parallel)
+library(caTools)
+
+setwd("D:/path/to/timeseries/data")
+
+# load layernames (downloaded from GEE)
+layers <- read.table("layernames.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+layers$day <- as.Date(as.character(layers$date), format = "%Y%m%d")
+
+# get list of all possible days
+all_days <- data.frame(day = seq(as.Date("2017-07-03"), as.Date("2019-07-02"), by = 1))
+all_days$year <- format(all_days$day, "%Y")
+
+all(layers$day %in% all_days$day)
+
+all_days <- merge(all_days, layers[,c(2,5)], by = "day", all.x = TRUE)
+
+# stack time-series data (one file per month) together to one total stack
+files <- list.files(pattern = glob2rx("Time_series_*_merged.tif$"))
+for(f in 1:length(files)){
+  if(f == 1){
+    ndvi_stack <- brick(files[f])
+  }else{
+    ndvi_stack <- stack(ndvi_stack, brick(files[f]))
+  }
+}
+
+
+# create empty template
+empty_template <- ndvi_stack[[1]]                       
+# NA data: -32768, integer data format
+empty_template[] <- -32768
+storage.mode(empty_template[]) <- "integer"
+
+
+# create list of output file names (NDVI + date)
+pathnames <- paste0("NDVI_", c(gsub("-", "", as.character(all_days$day))))
+# list of file names + number of files needed for import in TIMESAT
+path_list <- c(as.character(length(all_days$day)))
+
+# loop through all possible dates
+for (i in c(1:length(all_days$day))){
+  d <- all_days$day[i]
+  name <- paste0(pathnames[i], ".img")
+  # if image is available for data, export image in HFA format, if not export empty template
+  # add file name to file list
+  if (d %in% layers$day){
+    path <- paste0(getwd(), "//", pathnames[i])
+    path_list <- c(path_list, path)
+    r <- ndvi_stack[[which(layers$day == d)]]
+    r <- r*32767
+    r[is.na(r)] <- -32768
+    storage.mode(r[]) <- "integer"
+    
+    writeRaster(r, name, format = "HFA", overwrite = TRUE)
+    
+  }else{
+    path <- paste0(getwd(), "//", pathnames[i])
+    path_list <- c(path_list, path)
+    writeRaster(empty_template, name,format = "HFA", overwrite= TRUE)
+  }
+  #pathnames <- c(pathnames, path)
+}
+# export file list
+write.table(path_list, "ndvi_list_short.txt", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+# translate all files (HFA format) to ENVI format
+files <- list.files(pattern = ".img$")
+for(f in files){
+  gdal_translate(f, dst_dataset = substr(f, 1, nchar(f)-4), ot = "Int16", of = "ENVI")
+}
+
+
+
+#########################################################################################################
+# Part 2: prepare harmonic regression data for import in TIMESAT
+
+
+setwd("D:/path/to/timeseries/data")
+
+# load layernames (downloaded from GEE)
+layers <- read.table("layernames.csv", header = TRUE, sep = ",", stringsAsFactors = FALSE)
+layers$day <- as.Date(as.character(layers$date), format = "%Y%m%d")
+
+all_days <- data.frame(day = seq(as.Date("2017-07-03"), as.Date("2019-07-02"), by = 5))
+all_days$year <- format(all_days$day, "%Y")
+
+all(layers$day %in% all_days$day)
+
+all_days <- merge(all_days, layers[,c(2,5)], by = "day", all.x = TRUE)
+
+setwd("D:/path/to/harmonic/regression/coefficients/")
+
+# load harmonic regression coefficients and give layer names
+harmonics <- brick("Harmonics_coeffs_noTrend_Muranga.tif")
+names(harmonics) <- c("constant", "phase_1", "phase_2", "phase_3", "amp_1", "amp_2", "amp_3")
+
+
+# create empty template: NA = -32768, integer format
+empty_template <- harmonics[[1]]                       
+empty_template[] <- -32768
+storage.mode(empty_template[]) <- "integer"
+
+# create list of output file names (NDVI + date)
+pathnames <- paste0("NDVI_fitted_", c(gsub("-", "", as.character(all_days$day))))
+# list of file names + number of files needed for import in TIMESAT
+path_list <- c(as.character(length(all_days$day)))
+
+# define function to calculate fitted values based on harmonic coefficients
+get_fitted_NDVI <- function(vals){
+  fitted <- vals[1] + (vals[5] * cos(1*time_rad-vals[2])) + 
+    (vals[6] * cos(2*time_rad - vals[3])) + 
+    vals[7] * cos(3*time_rad-vals[4])
+  return(fitted)
+}
+
+# loop through all possible days
+for (i in c(1:length(all_days$day))){
+  d <- all_days$day[i]
+  print(d)
+  name <- paste0(pathnames[i], ".img")
+  # if image is available in time series, calculate harmonically fitted value, if not export empty template
+  if (d %in% layers$day){
+    path <- paste0(getwd(), "//", pathnames[i])
+    path_list <- c(path_list, path)
+    
+    time_rad <- layers$timeRad[which(layers$day == d)]
+    
+    #fitted = constant + (amp_1 * cos(1*t-phase_1)) + (amp_2 * cos(2*t - phase_2)) + amp_3 * cos(3*t-phase_3)
+    
+    #r <- harmonics[[1]] + (harmonics[[5]] * cos(1*time_rad-harmonics[[2]])) + (harmonics[[6]] * cos(2*time_rad - harmonics[[3]])) + harmonics[[7]] * cos(3*time_rad-harmonics[[4]])
+    
+    Sys.time()
+    beginCluster(n = 7)
+    cl <- getCluster()
+    clusterExport(cl, list("time_rad"))
+    r <- clusterR(harmonics,calc, args = list(fun = get_fitted_NDVI))
+    #r <- clusterR(ndvi_stack, mean_function)
+    endCluster()
+    Sys.time()
+    
+    
+    r <- r*32767
+    r[is.na(r)] <- -32768
+    storage.mode(r[]) <- "integer"
+    
+    writeRaster(r, name, format = "HFA", overwrite = TRUE)
+    
+  }else{
+    path <- paste0(getwd(), "//", pathnames[i])
+    path_list <- c(path_list, path)
+    writeRaster(empty_template, name,format = "HFA", overwrite= TRUE)
+  }
+}
+# export layer list
+write.table(path_list, "ndvi_list.txt", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+# translate all files (HFA format) to ENVI format
+files <- list.files(pattern = ".img$")
+for(f in files){
+  gdal_translate(f, dst_dataset = substr(f, 1, nchar(f)-4), ot = "Int16", of = "ENVI")
+}

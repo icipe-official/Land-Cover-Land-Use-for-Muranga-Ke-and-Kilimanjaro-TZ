@@ -1,0 +1,111 @@
+// Set the region of interest to a point.
+
+//roi for tansania
+//var roi = ee.Geometry.Rectangle(36.85, -3.7, 37.76, -2.81);
+
+//roi for kenya
+var roi = ee.Geometry.Rectangle(36.7, -1.2, 37.5, -0.6)
+
+//define time period
+var start = ee.Date('2016-07-03')
+var end = ee.Date('2019-07-01')
+
+
+var startyr = start.get("year")
+var endyr = end.get("year")
+
+// Create list of dates for time series
+var n_days = end.difference(start,'day').round();
+var dates = ee.List.sequence(0,n_days,5);
+var make_datelist = function(n) {
+  return start.advance(n,'day').format("YYYY-MM-dd")
+}
+dates = dates.map(make_datelist);
+print(dates)
+
+// Function to mask clouds using the Sentinel-2 QA band.
+function maskS2clouds(image) {
+  var qa = image.select('QA60')
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+            qa.bitwiseAnd(cirrusBitMask).eq(0))
+
+  // Return the masked and scaled data, without the QA bands.
+  return image.updateMask(mask).divide(10000)
+      .select("B.*")
+      .copyProperties(image, ["system:time_start"])
+}
+
+function get_date(image){
+  var date = ee.Date(image.get("system:time_start")).format("YYYY-MM-dd")
+  return image.set("day", date)
+}
+
+// Load a collection of Sentinel TOA reflectance images.
+var s2_collection = ee.ImageCollection('COPERNICUS/S2')
+    .filterDate(start,end)
+    .filterBounds(roi)
+    // Pre-filter to get less cloudy granules.
+    //.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(maskS2clouds)
+    .map(get_date);
+
+
+print(s2_collection);
+//Map.addLayer(s2_collection.first(), {}, "first_img")
+
+var s2_collection = s2_collection.filter(ee.Filter.inList("day", dates));
+
+print(s2_collection)
+
+// Function to add an NDVI band, the dependent variable.
+var addNDVI = function(image) {
+  return image
+    .addBands(image.normalizedDifference(['B8', 'B4'])
+    .rename('NDVI'))
+    .float();
+};
+
+
+// Filter to the area of interest, mask clouds, add variables.
+var ndvi_s2 = s2_collection
+  .filterBounds(roi)
+  .map(addNDVI)
+  .select("NDVI");
+  
+print(ndvi_s2)
+
+//Calculate monthly maximum composite
+var monthly_max = function(i){
+  i = ee.Number(i);
+  var months = ee.List.sequence(1,12);
+  var filteredMax = months.map(function(j){
+    var filtered = ee.ImageCollection(ndvi_s2.filter(ee.Filter.calendarRange(i,i, 'year'))
+                              .filter(ee.Filter.calendarRange(j,j,'month')));
+    var monthMax = ee.Image(filtered.max())
+                    .set("year", i)
+                    .set("month", j)
+                    //.copyProperties(filtered.first(),['system:index']);
+    return monthMax;
+  });
+  return filteredMax;
+};
+
+var years = ee.List.sequence(startyr, endyr);
+var ndvi_max = ee.ImageCollection(years.map(monthly_max).flatten()).toBands()//.select(ee.List.sequence(6,41))
+print(ndvi_max);
+
+//Download monthly maximum composite
+Export.image.toDrive({
+  image: ndvi_max,
+  description: 'Kenya_monthly_max_201607_201907', //adapt name according to ROI
+  scale: 10,
+  region: roi,
+  crs: "EPSG:32737",
+  maxPixels: 1e10, 
+});

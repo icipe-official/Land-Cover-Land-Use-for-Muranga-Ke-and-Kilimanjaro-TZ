@@ -1,0 +1,210 @@
+library(raster)
+library(caTools)
+
+
+
+setwd("D:/path/to/timesat/outputs")
+metrics <- c("sos","eos", "los", "baseval", "timemid", "maxval", "ampl", "lderiv", "rderiv", "lint", "sint", "sosval", "eosval")
+adds <- c("season1", "season2","both_seasons", "nseas")
+
+img_files <- list.files()
+img_files <- img_files[!grepl("[\\.]", img_files)]
+img_files
+
+######################################################################################################################################
+# convert TIMESAT outputs to tif-files
+
+#v1: convert each file to tif
+# for(i in img_files){
+#   hdr_files <- list.files(pattern = ".hdr")
+#   hdr_file <- hdr_files[1]
+#   file.rename(from = hdr_file, to = paste0(i, ".hdr"))
+#   r <- brick(i)
+#   #r[r == -2] <- NA
+#   #r[r == -1] <- NA
+#   print(i)
+#   print(min(getValues(r), na.rm = TRUE))
+#   print(max(getValues(r), na.rm = TRUE))
+#   plot(r, main = i)
+#   writeRaster(r, paste0(i, ".tif"), overwrite = TRUE)
+# }
+
+# function: replace -1 and -2 by NA
+# remove_na <- function(vals){
+#   vals_no_na <- vals[!(vals %in% c(-1,-2))]
+#   
+#   changed_vals <- c(vals_no_na, rep(-2, 4-(length(vals_no_na))))
+#   return(changed_vals)
+# }
+
+# v2: combine same phenology metrics of different seasons to one layer stack
+ext <- c(244010, 333110, 9867250, 9933660) #Muranga
+#ext <- c(260980,362300,9590740,9689340) #Tanzania
+proj <- "+proj=utm +zone=37 +south +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+for (m in metrics){
+  if(exists("metric_stack")){rm(metric_stack)}
+  metric_files <- img_files[grepl(m, img_files)]
+  for(s in c(1:2)){
+    for(a in c("season1", "season2")){
+      file <- metric_files[grepl(paste0(m, s, "_", a), metric_files)]
+      hdr_file <- list.files(pattern = ".hdr")[1]
+      file.rename(from = hdr_file, to = paste0(file, ".hdr"))
+      r <- raster(read.ENVI(file, headerfile = paste0(file, ".hdr")))
+      
+      extent(r) <- ext
+      projection(r) <- proj
+      
+      #unique_vals <- unique(getValues(r))
+      
+      if(!exists("metric_stack")){
+        metric_stack <- r
+        names(metric_stack) <- paste0(m, s, "_", a)
+      }else{
+        metric_stack <- stack(metric_stack, r)
+        names(metric_stack)[nlayers(metric_stack)] <- paste0(m, s, "_", a)
+      }
+      
+    }
+  }
+  
+  writeRaster(metric_stack, paste0("final_setting_",m, ".tif"), overwrite = TRUE)
+  
+  # metric_stack_changed <- calc(metric_stack, fun = remove_na)
+  
+  
+  # Sys.time()
+  # beginCluster(n = 3)
+  # cl <- getCluster()
+  # #clusterExport(cl)
+  # metric_stack_changed <- clusterR(metric_stack, calc, args = list(fun = remove_na))
+  # endCluster()
+  # Sys.time()
+  
+}
+
+
+#######################################################################################################################################
+
+
+# extract number of seasons based on SOS raster (count number of non NA values))
+sos <- brick("name_of_sos_raster.tif")
+for (l in c(1:nlayers(sos))){
+  sos[[l]][sos[[l]] == -2 ] <- NA
+  sos[[l]][sos[[l]] == -1 ] <- NA
+}
+
+
+Sys.time()
+beginCluster(n = 3)
+cl <- getCluster()
+nseas <- clusterR(sos, calc,args = list(fun = function(x){return(sum(!is.na(x)))}))
+endCluster()
+Sys.time()
+#nseas <- calc(sos, fun = function(x){return(sum(!is.na(x)))})
+writeRaster(nseas, "nseas.tif", overwrite = TRUE)
+
+#######################################################################################################################################
+
+#extract phenological metrics of observed biannual cycle (October 2017 - May 2018)
+
+metric_names <- c("sos","eos", "los", "baseval", "timemid", "maxval", "ampl", "lderiv", "rderiv", "lint", "sint", "sosval", "eosval")
+#setwd("D:/path/to/TIMESAT/outputs/in/tif/format")
+
+# stack all phenology metrics together
+for(m in metric_names){
+  if (which(metrics == m) == 1){
+    metric_stack <- brick(paste0("final_setting_", m, ".tif"))
+  }else{
+    r <- brick(paste0("final_setting_", m, ".tif"))
+    metric_stack <- stack(metric_stack, r)
+  }
+}
+rm(r)
+names(metric_stack) <- paste0(rep(metric_names, each = 4), c(1,2,3,4))
+
+
+# define function to extract the two seasons of the year of interest from the layer stack
+# (function on pixel level)
+get_dualmetrics <- function(vals){
+  vals <- as.numeric(vals)
+  vals[vals %in% c(-2,-1)] <- NA
+  
+  # get number of seasons
+  nseas <- sum(!is.na(vals))/13
+  
+  #filter seasons
+  #seasons must start before 08.2018
+  #seasons must end after 1.11.2017
+  all_sos <- vals[1:4]
+  all_eos <- vals[5:8]
+  possible_sos <- which(all_sos < 77)
+  possible_eos <- which(all_eos >= 24)
+  possible <- intersect(possible_sos, possible_eos)
+  # number of seasons in the define time period
+  nseas_filt <- length(possible)
+  
+  # output -1 if no season detected
+  if(nseas_filt == 0){
+    metrics <- rep(-1, 26)
+  # output: all detected seasons if two seasons detected
+  }else if(nseas_filt == 2){
+    which_season <- rep(FALSE,4)
+    which_season[possible] <- TRUE
+    metrics <- vals[rep(which_season,13)]
+  # output: detected season + -1 for missing second season if only one season detected
+  }else if(nseas_filt == 1){
+    which_season <- rep(FALSE,4)
+    which_season[possible] <- TRUE
+    metrics <- vals[rep(which_season,13)]
+    # consider season as first season if sos before January 2018 (timestep 36)
+    if(metrics[1]< 36){
+      metrics <- as.vector(rbind(metrics,rep(-1, 13)))
+    # consider season as second season if sos after January 2018 (timestep 36)
+    }else{
+      metrics <- as.vector(rbind(rep(-1, 13), metrics))
+    }
+  # if more than two seasons detected in time period: ignore season with smallest amplitude
+  }else if(nseas_filt == 3){
+    all_ampl <- vals[25:28]
+    choice <- which(!(all_ampl == min(all_ampl, na.rm = TRUE))) #if all three season within the accepted time, choose the two seasons with larger amplitudes
+    
+    if(length(choice) == 2){
+      which_season <- rep(FALSE,4)
+      which_season[choice] <- TRUE
+      metrics <- vals[rep(which_season,13)]
+    }
+    
+    # if several seasons have minimum apmplitude, ignore the last season with minimum amplitude (often already belongs to next biannual cycle)
+    if(length(choice) == 1){
+      choice <- sort(c(choice, which((all_ampl == min(all_ampl, na.rm = TRUE)))[1]))
+      which_season <- rep(FALSE,4)
+      which_season[choice] <- TRUE
+      metrics <- vals[rep(which_season,13)]
+    }
+    
+    #if(length(choice) == 3){
+    #  choice <- choice[1:2]
+    #  which_season <- rep(FALSE,4)
+    #  which_season[choice] <- TRUE
+    #  metrics <- vals[rep(which_season,13)]
+    #}
+    
+    
+  }
+  metrics <- as.numeric(metrics)
+  return(metrics)
+}
+
+#cluster_function <- function(x){calc(x, fun = get_dualmetrics)}
+
+
+# apply function and extract two sets of phenological metrics
+Sys.time()
+beginCluster(n = 3)
+cl <- getCluster()
+output <- clusterR(metric_stack, calc,args = list(fun = get_dualmetrics))
+endCluster()
+Sys.time()
+
+writeRaster(output, "phenology_filtered.tif")

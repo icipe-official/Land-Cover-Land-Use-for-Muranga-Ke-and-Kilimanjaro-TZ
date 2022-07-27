@@ -1,0 +1,161 @@
+library(raster)
+library(gdalUtils)
+library(snow)
+library(parallel)
+library(caTools)
+library(ggplot2)
+
+setwd("D:/path/to/working/directory")
+
+# possible parameters from parameter tuning
+envelopes <- c(1,2,3)
+strengths <- c(4,7,10)
+SG_sizes <- c(5,10,15,20)
+
+# load tuning data (precipitation and farming system classes
+prec <- brick("D:/path/to/Tuningdata_Timesat_precipitation.tif")
+classes <- raster("D:/path/to/Tuningdata_Timesat_classes.tif")
+
+# function extract fitted ndvi values and precipitation values from stack,
+# calculate mean ndvi per month, correlate mean ndvi with precipitation
+get_correlation <- function(stack_vals){
+  vals <- stack_vals[1:146]
+  prec_vals <-stack_vals[147:170]
+  data <- data.frame(date = all_days$day, ndvi = vals)
+  data$yearmonth <- format(data$date, "%Y%m")
+  ndvi_month <- tapply(data$ndvi, data$yearmonth, FUN = mean)
+  
+
+  corr_value <- cor(prec_vals, ndvi_month, method = "pearson")
+  return(corr_value)
+
+}
+
+
+# function: plot correlation
+plot_correlation <- function(vals = stack_vals){
+  vals <- stack_vals[1:146]
+  prec_vals <-stack_vals[147:170]
+  data <- data.frame(date = all_days$day, ndvi = vals)
+  data$yearmonth <- format(data$date, "%Y%m")
+  ndvi_month <- tapply(data$ndvi, data$yearmonth, FUN = mean)
+  
+  g1 <- ggplot()+
+             geom_line(aes(x = seq(0,23), y = prec_vals), colour = "blue")+
+             geom_line(aes(x = seq(1,24), y= ndvi_month/32767*max(prec_vals)), colour = "green")+
+             scale_y_continuous(sec.axis = sec_axis(~.*(1/max(prec_vals)), name = "NDVI"))
+  
+  g2 <- ggplot()+
+     geom_point(aes(x = prec_vals, y = ndvi_month/32767))
+  
+  return(list(g1,g2))
+
+}
+
+
+cluster_function <- function(x){calc(x, fun = get_correlation)}
+
+# loop through all parameter tuning results
+corr_rasters <- list()
+l = 1
+for(e in envelopes){
+  for(s in strengths){
+    for (f in SG_sizes){
+      # load fitted ndvi time series data
+      setting <- paste("Setting",e,s,f, sep = "_")
+      
+      setwd(file.path("D:/path/to/TIMESAT_results", setting))
+      files <- list.files(pattern = paste0(setting, "_fitted"))
+      files <- files[!grepl("[\\.]", files)]
+      for(i in c(1:length(files))){
+        #for(i in c(1:73)){
+        hdr_files <- list.files(pattern = ".hdr")
+        hdr_file <- hdr_files[1]
+        file.rename(from = hdr_file, to = paste0(files[i], ".hdr"))
+        r <- raster(read.ENVI(files[i]))
+        if(i == 1){
+          ndvi_fitted <- r
+        }else{
+          ndvi_fitted <- stack(ndvi_fitted, r)
+        }
+      }
+      names(ndvi_fitted) <- seq(as.Date("2017-07-03"), as.Date("2019-07-01"), by = 5)
+
+      
+      ndvi_fitted[ndvi_fitted == -32768] <- NA
+
+      
+      
+      all_days <- data.frame(day = seq(as.Date("2017-07-03"), as.Date("2019-07-01"), by = 5))
+      all_days$year <- format(all_days$day, "%Y")
+      
+
+      # stack fitted ndvi data and precipitation data
+      stack <- stack(ndvi_fitted, prec)
+      
+
+      # apply function to calculate correlation raster
+      Sys.time()
+      beginCluster(n = 3)
+      cl <- getCluster()
+      clusterExport(cl, varlist = c("all_days", "get_correlation"))
+      corr_raster <- clusterR(stack,cluster_function)
+      endCluster()
+      Sys.time()
+      
+      
+      # save correlation raster for parameter setting in a list
+      corr_rasters[[l]] <- corr_raster
+      names(corr_rasters)[l] <- setting
+      
+      l = l+1
+      
+    }
+  }
+}
+rm(cl, corr_raster, r, ndvi_fitted)
+
+
+setting_names <- names(corr_rasters)
+corr_rasters <- stack(corr_rasters)
+
+# in order to calculate correlation only for natural vegetation, set pixels of all other classes to 0
+corr_rasters_natural <- corr_rasters
+corr_rasters_natural[classes %in% c(10,12)] <- NA 
+corr_rasters_natural2 <- corr_rasters
+corr_rasters_natural2[classes %in% c(10,11,12)] <- NA #remove vegetable system from classes as well
+
+# calculate mean and standard deviation of correlation for the entire dataset (for each parameter combination)
+corr_data <- data.frame(setting = names(corr_rasters), 
+                        mean_corr = cellStats(corr_rasters, stat = "mean", na.rm = TRUE), 
+                        sd_corr = cellStats(corr_rasters, stat = "sd", na.rm = TRUE))
+
+corr_data_natural <- data.frame(setting = names(corr_rasters_natural), 
+                                mean_corr = cellStats(corr_rasters_natural, stat = "mean", na.rm = TRUE), 
+                                sd_corr = cellStats(corr_rasters_natural, stat = "sd", na.rm = TRUE))
+
+corr_data_natural2 <- data.frame(setting = names(corr_rasters_natural2), 
+                                mean_corr = cellStats(corr_rasters_natural2, stat = "mean", na.rm = TRUE), 
+                                sd_corr = cellStats(corr_rasters_natural2, stat = "sd", na.rm = TRUE))
+
+
+ggplot(data = corr_data)+
+  geom_line(aes(x = c(1:36), y = mean_corr))+
+  geom_line(aes(x = c(1:36), y = sd_corr))
+
+corr_matrix <- matrix(nrow = 36, ncol = 36)
+rownames(corr_matrix) <- names(corr_rasters)
+colnames(corr_matrix) <- names(corr_rasters)
+
+# plot correlation for some sample cells
+sample_cells <- sample(1:16100, 10)
+
+for(i in sample_cells){
+  stack_vals <- c(stack[i])
+  g <- plot_correlation(vals = stack_vals)
+  print(g[[1]])
+  print(g[[2]])
+}
+
+
+setwd("D:/Katrin/04_Masterarbeit/04_Software_R/timesat33/run")
